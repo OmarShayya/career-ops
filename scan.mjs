@@ -106,6 +106,31 @@ function parseLever(json, companyName) {
 
 const PARSERS = { greenhouse: parseGreenhouse, ashby: parseAshby, lever: parseLever };
 
+// ── Adzuna API (requires ADZUNA_APP_ID + ADZUNA_APP_KEY in .env) ───
+
+async function fetchAdzuna(titleFilter, config) {
+  const appId = process.env.ADZUNA_APP_ID;
+  const appKey = process.env.ADZUNA_APP_KEY;
+  if (!appId || !appKey) return null; // silently skip if no credentials
+
+  const country = config.adzuna_country || 'es'; // default: Spain
+  const query = config.adzuna_query || 'software engineer backend';
+  const url = `https://api.adzuna.com/v1/api/jobs/${country}/search/1?app_id=${appId}&app_key=${appKey}&results_per_page=50&what=${encodeURIComponent(query)}&content-type=application/json`;
+
+  const data = await fetchJson(url);
+  const results = data.results || [];
+
+  return results
+    .filter(j => j.title && titleFilter(j.title))
+    .map(j => ({
+      title: j.title,
+      url: j.redirect_url,
+      company: j.company?.display_name || 'Unknown',
+      location: j.location?.display_name || '',
+      source: 'adzuna-api',
+    }));
+}
+
 // ── Open job board APIs (no per-company config needed) ─────────────
 
 async function fetchRemoteOk(titleFilter) {
@@ -397,7 +422,30 @@ async function main() {
 
   await parallelFetch(tasks, CONCURRENCY);
 
-  // 4b. Fetch open job boards (RemoteOK, Remotive, WeWorkRemotely)
+  // 4b. Adzuna (API key required — skips silently if not configured)
+  if (!filterCompany) {
+    try {
+      const adzunaJobs = await fetchAdzuna(titleFilter, config);
+      if (adzunaJobs === null) {
+        // No credentials — silent skip
+      } else {
+        totalFound += adzunaJobs.length;
+        for (const job of adzunaJobs) {
+          if (seenUrls.has(job.url)) { totalDupes++; continue; }
+          const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`;
+          if (seenCompanyRoles.has(key)) { totalDupes++; continue; }
+          seenUrls.add(job.url);
+          seenCompanyRoles.add(key);
+          newOffers.push(job);
+        }
+        console.log(`  ✓ Adzuna: ${adzunaJobs.length} jobs found`);
+      }
+    } catch (err) {
+      errors.push({ company: 'Adzuna', error: err.message });
+    }
+  }
+
+  // 4c. Fetch open job boards (RemoteOK, Remotive, WeWorkRemotely)
   const openBoards = config.open_boards !== false; // enabled by default, disable with open_boards: false in portals.yml
   if (openBoards && !filterCompany) {
     const boardSources = [

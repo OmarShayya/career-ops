@@ -16,6 +16,7 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import { chromium } from 'playwright';
 import yaml from 'js-yaml';
 
@@ -121,7 +122,47 @@ function appendToScanHistory(offers, date) {
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
 }
 
+// ── LinkedIn state directory ─────────────────────────────────────────
+
+const LINKEDIN_STATE_DIR = 'data/browser-profiles/linkedin';
+
 // ── Scrapers ────────────────────────────────────────────────────────
+
+async function scrapeLinkedIn(page, query) {
+  const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(query)}&location=Spain&f_TPR=r86400&f_WT=2`;
+  console.log(`  LinkedIn: ${searchUrl}`);
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: SCRAPE_TIMEOUT });
+
+  // If redirected to login, session expired
+  if (/\/login|\/uas\/login/.test(page.url())) {
+    console.log('  LinkedIn: Session expired — run with --linkedin-login to re-auth');
+    return [];
+  }
+
+  await page.waitForSelector('ul.jobs-search__results-list, .jobs-search-results-list', { timeout: 15_000 }).catch(() => {});
+
+  const cards = await page.$$eval(
+    'ul.jobs-search__results-list li, li.jobs-search-results__list-item',
+    (nodes) =>
+      nodes.slice(0, 30).map((node) => {
+        const a = node.querySelector('a.base-card__full-link, a.job-card-list__title');
+        const title = node.querySelector('h3, .base-search-card__title')?.textContent?.trim() ?? '';
+        const company = node.querySelector('.base-search-card__subtitle, .job-card-container__company-name')?.textContent?.trim() ?? '';
+        const location = node.querySelector('.job-search-card__location, .job-card-container__metadata-item')?.textContent?.trim() ?? '';
+        return { url: a?.href ?? '', title, company, location };
+      })
+  );
+
+  return cards
+    .filter(c => c.url && c.title)
+    .map(c => ({
+      title: c.title,
+      url: c.url.split('?')[0], // strip tracking params
+      company: c.company || 'Unknown',
+      location: c.location || 'Spain',
+      source: 'linkedin-scrape',
+    }));
+}
 
 async function scrapeIndeed(page, query) {
   const searchUrl = `https://es.indeed.com/jobs?q=${encodeURIComponent(query)}&l=Spain&fromage=3`;
@@ -234,13 +275,14 @@ async function main() {
   const query = customQuery || config.scrape_query || 'backend engineer';
 
   const boards = [
+    { name: 'LinkedIn', fn: scrapeLinkedIn, id: 'linkedin', needsAuth: true },
     { name: 'Indeed', fn: scrapeIndeed, id: 'indeed' },
     { name: 'InfoJobs', fn: scrapeInfoJobs, id: 'infojobs' },
     { name: 'Tecnoempleo', fn: scrapeTecnoempleo, id: 'tecnoempleo' },
   ].filter(b => !filterBoard || b.id === filterBoard);
 
   if (boards.length === 0) {
-    console.error(`Unknown board: ${filterBoard}. Available: indeed, infojobs, tecnoempleo`);
+    console.error(`Unknown board: ${filterBoard}. Available: linkedin, indeed, infojobs, tecnoempleo`);
     process.exit(1);
   }
 
@@ -257,14 +299,55 @@ async function main() {
   const newOffers = [];
   const errors = [];
 
+  // LinkedIn login mode: opens visible browser for manual login, saves session
+  const linkedinLogin = args.includes('--linkedin-login');
+  if (linkedinLogin) {
+    mkdirSync(LINKEDIN_STATE_DIR, { recursive: true });
+    console.log('\nOpening LinkedIn for manual login...');
+    console.log('Log in, then close the browser window when done.\n');
+    const loginBrowser = await chromium.launchPersistentContext(LINKEDIN_STATE_DIR, {
+      headless: false,
+      viewport: { width: 1280, height: 800 },
+    });
+    const loginPage = await loginBrowser.newPage();
+    await loginPage.goto('https://www.linkedin.com/login');
+    // Wait for user to close browser
+    await loginBrowser.waitForEvent('close', { timeout: 300_000 }).catch(() => {});
+    console.log('LinkedIn session saved. Run without --linkedin-login to scrape.\n');
+    process.exit(0);
+  }
+
   // Launch browser once, reuse for all scrapers (sequential)
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-  });
+  const hasLinkedIn = boards.some(b => b.id === 'linkedin');
+  const linkedinStateExists = existsSync(join(LINKEDIN_STATE_DIR, 'Default'));
+
+  let browser;
+  let context;
+
+  if (hasLinkedIn && linkedinStateExists) {
+    // Use persistent context for LinkedIn (preserves login cookies)
+    mkdirSync(LINKEDIN_STATE_DIR, { recursive: true });
+    context = await chromium.launchPersistentContext(LINKEDIN_STATE_DIR, {
+      headless: true,
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+    browser = null; // persistent context manages its own browser
+  } else {
+    browser = await chromium.launch({ headless: true });
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+  }
 
   for (const board of boards) {
+    // Skip LinkedIn if no saved session
+    if (board.id === 'linkedin' && !linkedinStateExists) {
+      console.log(`  LinkedIn: No saved session — run with --linkedin-login first`);
+      continue;
+    }
+
     try {
       const page = await context.newPage();
       const jobs = await board.fn(page, query);
@@ -288,7 +371,11 @@ async function main() {
     }
   }
 
-  await browser.close();
+  if (browser) {
+    await browser.close();
+  } else {
+    await context.close(); // persistent context
+  }
 
   // Write results
   if (!dryRun && newOffers.length > 0) {
